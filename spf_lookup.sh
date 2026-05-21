@@ -1,17 +1,21 @@
 #!/bin/bash
 # SPF resolver + CIDR aggregator
+# Uso:  bash spf_lookup.sh           → record piatto unico
+#       bash spf_lookup.sh --split   → divide in due sottodomini (consigliato se > 450 chars)
+#
 # Requisiti: dig (sudo apt install dnsutils)
 #            python3 + netaddr (pip3 install netaddr)
 
 set -euo pipefail
 
+SPLIT_MODE=false
+[[ "${1:-}" == "--split" ]] && SPLIT_MODE=true
+
 if ! command -v dig &>/dev/null; then
-    echo "ERRORE: dig non trovato. Installa con: sudo apt install dnsutils"
-    exit 1
+    echo "ERRORE: dig non trovato. Installa con: sudo apt install dnsutils"; exit 1
 fi
 if ! python3 -c "import netaddr" 2>/dev/null; then
-    echo "ERRORE: netaddr non trovato. Installa con: pip3 install netaddr"
-    exit 1
+    echo "ERRORE: netaddr non trovato. Installa con: pip3 install netaddr"; exit 1
 fi
 
 ROOT_DOMAINS=(
@@ -25,11 +29,11 @@ declare -A VISITED
 declare -a ALL_IPS
 
 get_spf_record() {
-    local domain="$1"
-    # dig TXT (senza +short) mette tutti gli chunk di un record sulla STESSA riga,
-    # es:  zcsend.net. 3600 IN TXT "parte1" "parte2"
-    # Così sed può unire i chunk prima che grep filtri la riga.
-    dig TXT "$domain" 2>/dev/null \
+    # dig TXT (senza +short) tiene tutti i chunk dello stesso record sulla stessa riga:
+    #   example.com. 3600 IN TXT "parte1" "parte2"
+    # sed rimuove i confini tra chunk prima di togliere le virgolette,
+    # evitando spazi spuri nel mezzo degli indirizzi IPv6.
+    dig TXT "$1" 2>/dev/null \
         | grep -v '^;' \
         | grep -iE 'IN[[:space:]]+TXT' \
         | grep -i 'v=spf1' \
@@ -47,8 +51,7 @@ resolve_spf() {
     txt=$(get_spf_record "$domain")
 
     if [[ -z "$txt" ]]; then
-        echo "  [WARN] nessun record SPF per: $domain"
-        return
+        echo "  [WARN] nessun record SPF per: $domain"; return
     fi
 
     echo "  [SPF] $domain"
@@ -63,11 +66,11 @@ resolve_spf() {
     done
 }
 
+# ── FASE 1 ────────────────────────────────────────────────────────────────────
 echo ""
 echo "╔══ FASE 1: risoluzione SPF ricorsiva ══════════════════════════════════╗"
 for domain in "${ROOT_DOMAINS[@]}"; do
-    echo ""
-    echo "  [ROOT] $domain"
+    echo ""; echo "  [ROOT] $domain"
     resolve_spf "$domain"
 done
 
@@ -78,14 +81,17 @@ echo "╠══ FASE 2: deduplicazione ═════════════�
 echo "  IP trovati (con duplicati) : ${#ALL_IPS[@]}"
 echo "  IP dopo deduplicazione     : ${#DEDUPED[@]}"
 
+# ── FASE 3: aggregazione + output ─────────────────────────────────────────────
 echo ""
 echo "╠══ FASE 3: aggregazione CIDR ══════════════════════════════════════════╣"
 
-AGGREGATED=$(python3 - "${DEDUPED[@]}" <<'PYEOF'
+python3 - "${SPLIT_MODE}" "${DEDUPED[@]}" <<'PYEOF'
 import sys
 from netaddr import IPNetwork, cidr_merge
 
-ips = sys.argv[1:]
+split_mode = sys.argv[1] == "true"
+ips = sys.argv[2:]
+
 ip4_raw = [ip for ip in ips if ":" not in ip]
 ip6_raw = [ip for ip in ips if ":" in ip]
 
@@ -95,43 +101,52 @@ def safe_parse(lst, label):
         try:
             nets.append(IPNetwork(i))
         except Exception as e:
-            print(f"  [WARN] IP non valido ignorato ({label}): {i!r} -> {e}", file=sys.stderr)
+            print(f"  [WARN] IP ignorato ({label}): {i!r} → {e}", file=sys.stderr)
     return nets
 
-ip4_nets = safe_parse(ip4_raw, "ip4")
-ip6_nets = safe_parse(ip6_raw, "ip6")
-
-merged4 = list(cidr_merge(ip4_nets)) if ip4_nets else []
-merged6 = list(cidr_merge(ip6_nets)) if ip6_nets else []
+merged4 = list(cidr_merge(safe_parse(ip4_raw, "ip4"))) if ip4_raw else []
+merged6 = list(cidr_merge(safe_parse(ip6_raw, "ip6"))) if ip6_raw else []
+all_merged = [f"ip4:{n}" for n in merged4] + [f"ip6:{n}" for n in merged6]
 
 print(f"  IP4 prima: {len(ip4_raw)}  dopo aggregazione: {len(merged4)}")
 print(f"  IP6 prima: {len(ip6_raw)}  dopo aggregazione: {len(merged6)}")
+print(f"  Totale range finali: {len(all_merged)}")
 
-parts = ["v=spf1"]
-parts += [f"ip4:{n}" for n in merged4]
-parts += [f"ip6:{n}" for n in merged6]
-parts.append("~all")
-print("RECORD:" + " ".join(str(p) for p in parts))
+def make_record(tokens, suffix="~all"):
+    return "v=spf1 " + " ".join(str(t) for t in tokens) + " " + suffix
+
+SEP = "\n" + "─" * 72
+
+if not split_mode:
+    rec = make_record(all_merged)
+    print(f"\n╠══ RISULTATO FINALE ═══════════════════════════════════════════════════╣")
+    print(f"\n{rec}\n")
+    print(f"  Lunghezza : {len(rec)} caratteri  |  DNS lookup: 0")
+    if len(rec) > 450:
+        print(f"\n  ATTENZIONE: > 450 caratteri.")
+        print(f"  Riesegui con:  bash spf_lookup.sh --split")
+    print(f"\n╚═══════════════════════════════════════════════════════════════════════╝")
+else:
+    # Dividere a metà cercando il punto di taglio che bilancia le lunghezze
+    mid = len(all_merged) // 2
+    spf1_tokens = all_merged[:mid]
+    spf2_tokens = all_merged[mid:]
+
+    rec1 = make_record(spf1_tokens)
+    rec2 = make_record(spf2_tokens)
+    # Il record principale usa 2 include (2 lookup DNS, ben sotto il limite di 10)
+    main = "v=spf1 include:_spf1.TUODOMINIO.com include:_spf2.TUODOMINIO.com ~all"
+
+    print(f"\n╠══ MODALITÀ SPLIT (2 lookup DNS totali) ═══════════════════════════════╣")
+    print(f"\n  Sostituisci TUODOMINIO.com con il tuo dominio reale.")
+    print(f"\n  Record principale (va sul dominio che manda mail):")
+    print(f"  {main}")
+    print(f"  ({len(main)} caratteri)\n")
+    print(SEP)
+    print(f"\n  TXT su _spf1.TUODOMINIO.com  ({len(rec1)} caratteri):")
+    print(f"  {rec1}\n")
+    print(SEP)
+    print(f"\n  TXT su _spf2.TUODOMINIO.com  ({len(rec2)} caratteri):")
+    print(f"  {rec2}\n")
+    print(f"╚═══════════════════════════════════════════════════════════════════════╝")
 PYEOF
-)
-
-echo "$AGGREGATED" | grep -v "^RECORD:" || true
-
-FINAL_RECORD=$(echo "$AGGREGATED" | grep "^RECORD:" | sed 's/^RECORD://')
-
-echo ""
-echo "╠══ RISULTATO FINALE ═══════════════════════════════════════════════════╣"
-echo ""
-echo "$FINAL_RECORD"
-echo ""
-echo "  Lunghezza record : ${#FINAL_RECORD} caratteri"
-echo "  DNS lookup       : 0  (nessun include/redirect)"
-
-if (( ${#FINAL_RECORD} > 450 )); then
-    echo ""
-    echo "  ATTENZIONE: Record > 450 caratteri. Alcuni MTA legacy potrebbero"
-    echo "  avere problemi. Valuta di spezzarlo in due sottodomini SPF."
-fi
-
-echo ""
-echo "╚═══════════════════════════════════════════════════════════════════════╝"
