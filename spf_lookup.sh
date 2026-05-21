@@ -36,9 +36,14 @@ resolve_spf() {
     VISITED[$domain]=1
 
     local txt
+    # dig split i record TXT lunghi in chunk da 255 byte separati da " "
+    # sed rimuove i confini tra chunk PRIMA di togliere le virgolette,
+    # così gli indirizzi IPv6 spezzati vengono ricomposti correttamente.
     txt=$(dig +short TXT "$domain" 2>/dev/null \
-        | tr -d '"' | tr '\n' ' ' \
-        | grep -io 'v=spf1[^"]*' | head -1)
+        | grep -i 'v=spf1' \
+        | sed 's/" "//g' \
+        | tr -d '"' \
+        | head -1)
 
     if [[ -z "$txt" ]]; then
         echo "  [WARN] nessun record SPF per: $domain"
@@ -83,14 +88,26 @@ import sys
 from netaddr import IPNetwork, cidr_merge
 
 ips = sys.argv[1:]
-ip4 = [ip for ip in ips if ":" not in ip]
-ip6 = [ip for ip in ips if ":" in ip]
+ip4_raw = [ip for ip in ips if ":" not in ip]
+ip6_raw = [ip for ip in ips if ":" in ip]
 
-merged4 = cidr_merge([IPNetwork(i) for i in ip4]) if ip4 else []
-merged6 = cidr_merge([IPNetwork(i) for i in ip6]) if ip6 else []
+def safe_parse(lst, label):
+    nets = []
+    for i in lst:
+        try:
+            nets.append(IPNetwork(i))
+        except Exception as e:
+            print(f"  [WARN] IP non valido ignorato ({label}): {i!r} -> {e}", file=sys.stderr)
+    return nets
 
-print(f"IP4 prima: {len(ip4)}  dopo aggregazione: {len(merged4)}")
-print(f"IP6 prima: {len(ip6)}  dopo aggregazione: {len(merged6)}")
+ip4_nets = safe_parse(ip4_raw, "ip4")
+ip6_nets = safe_parse(ip6_raw, "ip6")
+
+merged4 = cidr_merge(ip4_nets) if ip4_nets else []
+merged6 = cidr_merge(ip6_nets) if ip6_nets else []
+
+print(f"IP4 prima: {len(ip4_raw)}  dopo aggregazione: {len(merged4)}")
+print(f"IP6 prima: {len(ip6_raw)}  dopo aggregazione: {len(merged6)}")
 
 parts = ["v=spf1"]
 parts += [f"ip4:{n}" for n in merged4]
